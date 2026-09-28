@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
+import numpy as np
 import requests
 import streamlit as st
 
@@ -118,7 +118,7 @@ def fetch_market() -> pd.DataFrame:
     df["age_sec"] = (int(time.time()) - pd.to_numeric(recency, errors="coerce")).clip(lower=0)
     # Ranking is a heuristic, not a promise of fill or profit.
     positive = df["margin"].clip(lower=0)
-    liquidity = pd.Series(pd.np.log1p(df["volume_5m"].clip(lower=0)) if hasattr(pd, "np") else __import__("numpy").log1p(df["volume_5m"].clip(lower=0)), index=df.index)
+    liquidity = pd.Series(np.log1p(df["volume_5m"].clip(lower=0)), index=df.index)
     roi_quality = df["roi_pct"].clip(lower=0, upper=15) / 15
     liq_quality = liquidity / max(float(liquidity.max() or 1), 1)
     freshness = (1 - (df["age_sec"] / 3600).clip(lower=0, upper=1))
@@ -137,21 +137,12 @@ def save_snapshot(df: pd.DataFrame) -> None:
     })
     con = db()
     try:
-        rows = [
-            tuple(row)
-            for row in snap[[
-                "captured_at", "item_id", "high", "low",
-                "high_time", "low_time", "high_volume", "low_volume"
-            ]].itertuples(index=False, name=None)
-        ]
         con.executemany(
-            """
-            INSERT OR REPLACE INTO snapshots (
-                captured_at, item_id, high, low, high_time, low_time,
-                high_volume, low_volume
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
+            """INSERT OR REPLACE INTO snapshots
+            (captured_at, item_id, high, low, high_time, low_time, high_volume, low_volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            snap[["captured_at", "item_id", "high", "low", "high_time", "low_time", "high_volume", "low_volume"]]
+            .itertuples(index=False, name=None),
         )
         con.commit()
     finally:
@@ -188,15 +179,18 @@ def history_chart(item_id: int, hours: int = 24):
     timestep = "5m" if hours <= 24 else "1h"
     points = api_json("timeseries", {"timestep": timestep, "id": item_id}).get("data", [])
     h = pd.DataFrame(points)
-    if h.empty: return None
+    required = {"timestamp", "avgHighPrice", "avgLowPrice"}
+    if h.empty or not required.issubset(h.columns):
+        return None
     h["time"] = pd.to_datetime(h["timestamp"], unit="s", utc=True)
     cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
-    h = h[h["time"] >= cutoff]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=h["time"], y=h["avgHighPrice"], name="High-side average", line=dict(color="#32d583", width=2)))
-    fig.add_trace(go.Scatter(x=h["time"], y=h["avgLowPrice"], name="Low-side average", line=dict(color="#f5c451", width=2)))
-    fig.update_layout(height=410, margin=dict(l=10,r=10,t=15,b=10), template="plotly_dark", hovermode="x unified", yaxis_title="GP", legend=dict(orientation="h"))
-    return fig
+    h = h[h["time"] >= cutoff].copy()
+    if h.empty:
+        return None
+    return h.set_index("time")[["avgHighPrice", "avgLowPrice"]].rename(columns={
+        "avgHighPrice": "High-side average",
+        "avgLowPrice": "Low-side average",
+    })
 
 
 mapping = fetch_mapping()
@@ -265,8 +259,11 @@ def render_live_content():
             c.metric("Observed spread", fmt_gp(r["margin"]), f"{r['roi_pct']:.2f}% ROI")
             d.metric("5-minute volume", f"{r['volume_5m']:,.0f}")
             h = st.segmented_control("History", options=[6,24,168,720], default=24, format_func=lambda x: {6:"6 hours",24:"24 hours",168:"7 days",720:"30 days"}[x])
-            fig = history_chart(int(r["id"]), int(h or 24))
-            if fig: st.plotly_chart(fig, use_container_width=True)
+            chart_data = history_chart(int(r["id"]), int(h or 24))
+            if chart_data is not None:
+                st.line_chart(chart_data, height=410, use_container_width=True)
+            else:
+                st.info("No price history is available for the selected period.")
             st.markdown(f"**Buy-side timestamp:** {unix_age(r.get('sell_time'))} · **Sell-side timestamp:** {unix_age(r.get('buy_time'))} · **GE limit:** {r['limit']:,.0f}" if pd.notna(r['limit']) else "GE limit unavailable")
 
     elif nav == "Budget Builder":
