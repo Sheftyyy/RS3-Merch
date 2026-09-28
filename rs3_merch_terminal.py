@@ -9,9 +9,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
+import numpy as np
 import requests
 import streamlit as st
+
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ModuleNotFoundError:
+    go = None
+    PLOTLY_AVAILABLE = False
 
 APP_TITLE = "RS3 Merchant Terminal"
 API_BASE = "https://prices.runescape.wiki/api/v2/rs"
@@ -118,7 +125,7 @@ def fetch_market() -> pd.DataFrame:
     df["age_sec"] = (int(time.time()) - pd.to_numeric(recency, errors="coerce")).clip(lower=0)
     # Ranking is a heuristic, not a promise of fill or profit.
     positive = df["margin"].clip(lower=0)
-    liquidity = pd.Series(pd.np.log1p(df["volume_5m"].clip(lower=0)) if hasattr(pd, "np") else __import__("numpy").log1p(df["volume_5m"].clip(lower=0)), index=df.index)
+    liquidity = pd.Series(np.log1p(df["volume_5m"].clip(lower=0)), index=df.index)
     roi_quality = df["roi_pct"].clip(lower=0, upper=15) / 15
     liq_quality = liquidity / max(float(liquidity.max() or 1), 1)
     freshness = (1 - (df["age_sec"] / 3600).clip(lower=0, upper=1))
@@ -167,6 +174,8 @@ def market_display(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def history_chart(item_id: int, hours: int = 24):
+    if not PLOTLY_AVAILABLE:
+        return None
     timestep = "5m" if hours <= 24 else "1h"
     points = api_json("timeseries", {"timestep": timestep, "id": item_id}).get("data", [])
     h = pd.DataFrame(points)
@@ -248,7 +257,10 @@ def render_live_content():
             d.metric("5-minute volume", f"{r['volume_5m']:,.0f}")
             h = st.segmented_control("History", options=[6,24,168,720], default=24, format_func=lambda x: {6:"6 hours",24:"24 hours",168:"7 days",720:"30 days"}[x])
             fig = history_chart(int(r["id"]), int(h or 24))
-            if fig: st.plotly_chart(fig, use_container_width=True)
+            if fig is not None:
+                st.plotly_chart(fig, use_container_width=True)
+            elif not PLOTLY_AVAILABLE:
+                st.warning("Plotly is unavailable. Add plotly to requirements.txt to enable charts.")
             st.markdown(f"**Buy-side timestamp:** {unix_age(r.get('sell_time'))} · **Sell-side timestamp:** {unix_age(r.get('buy_time'))} · **GE limit:** {r['limit']:,.0f}" if pd.notna(r['limit']) else "GE limit unavailable")
 
     elif nav == "Budget Builder":
